@@ -14,7 +14,7 @@ online play. This repository is here so you can see exactly what it does.
   deflector charges.
 - Where you are: your galactic address, and whether you are on foot, in your ship or in an exocraft.
 - Your speed, from your position a second apart.
-- The flown ship's name and class.
+- The flown ship's name and class, and where its power is going (balanced, weapons, engines or shields).
 - The solar system (economy, wealth, conflict, race, star, number of planets) and the planet you are on (type,
   weather, flora, fauna, resources, scrap), with the planet's words through the game's own translator.
 
@@ -27,7 +27,9 @@ leans on shapes rather than offsets where it can: the player state by its run of
 position by its transform, inventories by their item lists. Every read through a pointer uses `ReadProcessMemory`,
 which fails politely on a bad address where a plain read would take the game down, and values read at a fixed
 distance are checked against what the game allows (enums, flags, a planet's own index, an inventory's class), so a
-field that has moved reads as unknown rather than wrong. It hooks nothing but NMS.py's main loop.
+field that has moved reads as unknown rather than wrong. Besides NMS.py's main loop it watches one game function,
+`cGcSpaceshipComponent::UpdateControlled`, which the game runs for the ship you are flying: the bridge keeps only
+that ship's address, to read its power setting, and does nothing else there.
 
 Written against game build 179666 with NMS.py 179105.0.
 
@@ -46,8 +48,9 @@ The NMS Deck plugin installs it for you: **Install the bridge** in any NMS Deck 
 JSON, rewritten once a second, atomically (written to a temporary file and renamed into place). `protocol` is the
 file's format version; `inGame` is false at the menu. Charges are fractions from 0 to 1; `system` holds the game's
 enum numbers; `planet` holds the game's own words and is null in space; `where.stable` is the game's
-`EnvironmentLocation` (1 space, 2 station, 3 on foot, 4 in the ship on a planet, 5 in an exocraft). Anything that could
-not be read is null.
+`EnvironmentLocation` (1 space, 2 station, 3 on foot, 4 in the ship on a planet, 5 in an exocraft); `power` is the
+flown ship's power setting (0 balanced, 1 weapons, 2 engines, 3 shields, the order Cycle Power steps through) and null
+when you are not flying. Anything that could not be read is null.
 
 ## Licence
 

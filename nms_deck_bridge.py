@@ -23,7 +23,7 @@ from nmspy.decorators import main_loop, on_fully_booted
 
 logger = getLogger("NMSDeck")
 
-VERSION = "0.5.2"
+VERSION = "0.6.0"
 PROTOCOL = 1
 OUT_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NMSDeck")
 STATE = os.path.join(OUT_DIR, "state.json")
@@ -388,6 +388,35 @@ def _where(env_addr):
     return {"location": loc, "stable": stable} if 0 <= loc <= 15 and 0 <= stable <= 15 else None
 
 
+# ---- the ship's power setting ------------------------------------------------------------------------------------------
+# The ship being flown is a cGcSpaceshipComponent; the game runs its UpdateControlled every frame for that one ship
+# only, which is how the bridge learns where it is. Its power setting (the one Cycle Power steps through) is a number
+# at +0x674C: 0 balanced, 1 weapons, 2 engines, 3 shields. Found on build 179666 by watching it step 0, 1, 2, 3, 0 on
+# every press and at no other time.
+SHIP_POWER = 0x674C
+POWER_FRESH = 2.0   # seconds: after this without UpdateControlled, the player is not flying
+
+
+def _pointer(p):
+    """A hook argument as an address: NMS.py hands pointers over as ctypes objects or plain numbers."""
+    try:
+        return ctypes.cast(p, ctypes.c_void_p).value or 0
+    except Exception:
+        try:
+            return int(p)
+        except Exception:
+            return 0
+
+
+def _power(ship_addr):
+    """The flown ship's power setting, 0 to 3, or None."""
+    raw = _safe(ship_addr + SHIP_POWER, 4) if ship_addr else None
+    if raw is None:
+        return None
+    value = struct.unpack_from("<i", raw, 0)[0]
+    return value if 0 <= value <= 3 else None
+
+
 def _ship_info(base, anchor, primary):
     """The flown ship's name and class (0 C, 1 B, 2 A, 3 S, from its technology inventory), or None."""
     if primary is None or not (0 <= primary < SHIP_COUNT):
@@ -409,6 +438,7 @@ class NMSDeckBridge(Mod):
         self._failed = {}   # field -> the first error it gave, for the probe report
         self._probed = False
         self._pos, self._pos_t = None, 0.0   # the last position read, and when, for the speed
+        self._ship, self._ship_t = 0, 0.0    # the flown ship (cGcSpaceshipComponent), and when the game last updated it
         os.makedirs(OUT_DIR, exist_ok=True)
         self._write({"protocol": PROTOCOL, "mod": VERSION, "inGame": False, "at": time.time()})
         logger.info(f"NMS Deck bridge {VERSION}: writing to {STATE}")
@@ -416,6 +446,13 @@ class NMSDeckBridge(Mod):
     @on_fully_booted
     def booted(self, *args):
         logger.info("NMS Deck bridge: the game is up")
+
+    # Once a frame, for the ship the player is flying and no other: only its address is kept, nothing else is done here.
+    @nms.cGcSpaceshipComponent.UpdateControlled.after
+    def flying(self, this, lfTimeStep, *args, **kwargs):
+        addr = _pointer(this)
+        if addr:
+            self._ship, self._ship_t = addr, time.monotonic()
 
     @main_loop.after
     def tick(self, *args):
@@ -458,6 +495,8 @@ class NMSDeckBridge(Mod):
         pos = self._read("position", lambda: _position(ctypes.addressof(env))) if env is not None else None
         where = self._read("where", lambda: _where(ctypes.addressof(env))) if env is not None else None
         t = time.monotonic()
+        flying = self._ship and t - self._ship_t < POWER_FRESH
+        power = self._read("power", lambda: _power(self._ship)) if flying else None
         scale = SPEED_SCALE_EXOCRAFT if where and where["stable"] == IN_EXOCRAFT else SPEED_SCALE
         speed = _speed(self._pos, pos, t - self._pos_t, scale) if self._pos is not None else None
         self._pos, self._pos_t = pos, t
@@ -474,6 +513,7 @@ class NMSDeckBridge(Mod):
             "planet": planet,
             "speed": speed,        # the HUD's speed, from the position a second ago; None when unknown or a jump
             "where": where,        # the game's EnvironmentLocation: 3 on foot, 4 in ship, 5 in exocraft... (see _where)
+            "power": power,        # the flown ship's power setting: 0 balanced, 1 weapons, 2 engines, 3 shields; None when not flying
         }
 
     # ---- writing ------------------------------------------------------------------------------------------------------
