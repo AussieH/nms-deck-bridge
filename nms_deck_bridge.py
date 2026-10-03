@@ -23,7 +23,7 @@ from nmspy.decorators import main_loop, on_fully_booted
 
 logger = getLogger("NMSDeck")
 
-VERSION = "0.6.1"
+VERSION = "0.6.2"
 PROTOCOL = 1
 OUT_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NMSDeck")
 STATE = os.path.join(OUT_DIR, "state.json")
@@ -731,14 +731,48 @@ class NMSDeckBridge(Mod):
 
     # ---- writing ------------------------------------------------------------------------------------------------------
     def _write(self, state):
-        """Written to a temporary file and renamed into place, so the plugin never reads half a file."""
+        """Written to a temporary file and renamed into place, so a reader never sees half a file. Windows refuses the
+        rename while another program has state.json open without delete sharing (iCUE's file watcher reading it for
+        the NMS Dashboard widget does, for a moment after each write): then a couple of short retries, and if it is
+        still held, the file is rewritten in place in one write, which a held file allows. Readers already skip a
+        file that does not parse, so a read caught mid-write costs one second at most."""
         tmp = STATE + ".tmp"
+        text = json.dumps(state)
         try:
             with open(tmp, "w", encoding="utf-8") as f:
-                json.dump(state, f)
-            os.replace(tmp, STATE)
+                f.write(text)
         except OSError as e:
-            logger.warning(f"NMS Deck bridge: could not write the state file: {e}")
+            self._write_failed(e)
+            return
+        for attempt in range(3):
+            try:
+                os.replace(tmp, STATE)
+                self._write_errors = 0
+                return
+            except PermissionError as e:
+                last = e
+                if attempt < 2:
+                    time.sleep(0.005)   # on the game's loop: 10 ms at most, then the fallback below
+            except OSError as e:
+                last = e
+                break
+        try:
+            with open(STATE, "w", encoding="utf-8") as f:
+                f.write(text)
+            self._write_errors = 0
+        except OSError as e:
+            self._write_failed(e if e else last)
+        finally:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+    def _write_failed(self, e):
+        """Logs a failed write once, then once a minute while it keeps failing, instead of every second."""
+        self._write_errors = getattr(self, "_write_errors", 0) + 1
+        if self._write_errors == 1 or self._write_errors % 60 == 0:
+            logger.warning(f"NMS Deck bridge: could not write the state file ({self._write_errors} in a row): {e}")
 
     def _note_probe(self, state, now):
         """Keeps, for each place the player has been (space, a station, on foot...), what the system and planet read

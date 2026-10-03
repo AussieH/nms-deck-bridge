@@ -37,6 +37,8 @@ that ship's address, to read its power setting, and does nothing else there.
 
 Written against game build 179666 with NMS.py 179105.0. 0.6.1 follows build 180383 (2026-09-30), which moved the
 solar system pointer.
+0.6.2 keeps writing the state file while another program holds it open (iCUE's file watcher, for the NMS
+Dashboard widget, refused the rename into place): after two short retries it rewrites the file in place.
 
 ## Installing
 
