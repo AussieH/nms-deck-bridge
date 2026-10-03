@@ -23,12 +23,13 @@ from nmspy.decorators import main_loop, on_fully_booted
 
 logger = getLogger("NMSDeck")
 
-VERSION = "0.6.0"
+VERSION = "0.6.1"
 PROTOCOL = 1
 OUT_DIR = os.path.join(os.environ.get("APPDATA", os.path.expanduser("~")), "NMSDeck")
 STATE = os.path.join(OUT_DIR, "state.json")
 PROBE = os.path.join(OUT_DIR, "probe.txt")
 EVERY = 1.0  # seconds between writes
+PROBE_EVERY = 5.0   # seconds at least between probe rewrites
 
 
 def _text(value):
@@ -116,9 +117,9 @@ PRIMARY_SHIP = 0x182A0
 STORE, STORE_LIST, ITEM = 0x248, 0x88, 0x30
 
 
-def _safe(addr, n):
+def _safe(addr, n, most=0x10000):
     """n bytes at addr, or None if they cannot be read."""
-    if not addr or n <= 0 or n > 0x10000:
+    if not addr or n <= 0 or n > most:
         return None
     buf = ctypes.create_string_buffer(n)
     got = ctypes.c_size_t(0)
@@ -227,9 +228,18 @@ def _tech(base, anchor):
 
 
 # ---- the solar system and the planet the player is at --------------------------------------------------------------
-# NMS.py 179105's offsets, which build 179666 has not moved (checked against the galaxy map and the discovery pages).
-SIM_SOLAR_SYSTEM = 0x24DFE0     # cGcSimulation::mpSolarSystem
+# cGcSimulation::mpSolarSystem is the game's own pointer to the solar system the player is in, and a game update can
+# move it. NMS.py 179105 and build 179666 have it at 0x24DFE0; build 180383 (the 2026-09-30 update) has it at
+# 0x25E020, where cGcSimulation::Update reads it to hand to cGcSolarSystem::Update: cGcSimulation grew 0x10040 before
+# it, while the solar system's own layout (size, planets, the offsets below) stayed as it was. The places known are
+# tried newest first, and the pointer is only taken when what it points at is the system the player is in. If none
+# is, a window of cGcSimulation is searched for a pointer that is, at most every SEARCH_EVERY seconds.
+SIM_SOLAR_SYSTEM = (0x25E020, 0x24DFE0)
+SIM_SEARCH, SEARCH_CHUNK = (0x240000, 0x280000), 0x10000
+SEARCH_EVERY = 60.0   # a search reads 256 KB and follows every pointer in it: rare, so it never stutters the game
 SYS_TRADING, SYS_CONFLICT, SYS_PLANETS, SYS_STAR = 0x2520, 0x2530, 0x2544, 0x2550   # cGcSolarSystemData
+SYS_UA = 0x26B0                 # cGcSolarSystem::mUA, the system's universe address
+SYS_HEAD = SYS_UA + 8 - SYS_TRADING
 SYS_PLANET0, PLANET_SIZE, PLANET_DATA = 0x2E30, 0xD9170, 0x60                        # cGcSolarSystem::maPlanets
 PD_INFO, PD_NAME = 0x3548, 0x3A4E                                                     # cGcPlanetData
 # ResourceLevel (0 low, 1 high: activated metals) and HasScrap, checked 2026-09-26 against the discovery summaries of
@@ -270,32 +280,200 @@ def _byte(addr):
     return raw[0] if raw else None
 
 
-def _world(sim_addr, planet_number):
-    """The solar system and the planet the player is at, for the keys, or (None, None). Checked against the game
-    (build 179666, 2026-09-25): the system's economy, wealth, conflict and race match the galaxy map, and the planet's
-    type, weather, flora, fauna and resources match its discovery page, through the game's own translations. The
-    galactic address counts planets from 1; 0 is none."""
-    raw = _safe(sim_addr + SIM_SOLAR_SYSTEM, 8)
-    ss = struct.unpack("<Q", raw)[0] if raw else 0
-    head = _safe(ss + SYS_TRADING, 0x38) if ss else None
+# Each of the system's numbers is one of the game's enums: TradingClass 0-6, WealthClass 0-3, PlayerConflictData 0-3,
+# AlienRace 0-8, GalaxyStarTypes 0-4, and a system has at most six planets. One out of range reads as unknown on its
+# own; the rest of the system is still shown.
+SYSTEM_FIELDS = (("economy", 0, 6), ("wealth", 0, 3), ("conflict", 0, 3), ("race", 0, 8), ("star", 0, 4), ("planets", 0, 6))
+
+
+def _system_fields(raw):
+    """(the system for the keys, the names of the fields read as unknown): each number checked on its own."""
+    system, bad = {}, []
+    for name, lo, hi in SYSTEM_FIELDS:
+        value = raw.get(name)
+        ok = isinstance(value, int) and lo <= value <= hi
+        system[name] = value if ok else None
+        if not ok:
+            bad.append(name)
+    return system, bad
+
+
+def _ua_address(ua):
+    """A universe address as {x, y, z, system}: from the low bits X, Z (12 bits each), Y (8) and the system (12), the
+    portal code's order backwards, with X, Z and Y signed."""
+    def signed(value, bits):
+        return value - (1 << bits) if value >= 1 << (bits - 1) else value
+    return {"x": signed(ua & 0xFFF, 12), "z": signed((ua >> 12) & 0xFFF, 12), "y": signed((ua >> 24) & 0xFF, 8),
+            "system": (ua >> 32) & 0xFFF}
+
+
+def _ua_matches(ua, loc):
+    """Whether a universe address is the player's star system (the planet is left out: a system's is none)."""
+    if not ua or not loc:
+        return False
+    got = _ua_address(ua)
+    return all(got[k] == loc.get(k) for k in ("x", "y", "z", "system"))
+
+
+def _is_system(raw, loc, strict=False):
+    """(whether what was read is the solar system the player is in, why), as pure logic over what was read. Its
+    address being the player's, or every planet carrying its own index, says so; where the pointer is known to live,
+    every number in range (all 0.6.0 asked) is enough as well. A search (strict) asks more of the planets: two or more
+    with their own indices and every number in range, since one planet with index 0 is what empty memory looks like."""
+    if raw is None:
+        return False, "nothing readable there"
+    _, bad = _system_fields(raw)
+    count, indices = raw.get("planets"), raw.get("indices")
+    if _ua_matches(raw.get("ua"), loc):
+        return True, "its address is the player's"
+    indexed = indices is not None and indices == list(range(count))
+    if indexed and (not strict or (count >= 2 and not bad)):
+        return True, "every planet carries its own index"
+    if not strict and not bad and count >= 1:
+        return True, "every number in range"
+    why = ["its address is not the player's"]
+    if indices is None:
+        why.append("no planet count to check indices against")
+    elif not indexed:
+        why.append(f"planet indices {indices}, wanted {list(range(count))}")
+    elif strict:
+        why.append("too few planets to be sure" if count < 2 else "")
+    if bad:
+        why.append("out of range: " + ", ".join(bad))
+    return False, "; ".join(w for w in why if w)
+
+
+def _system_raw(ss):
+    """What a candidate solar system holds, as read and unchecked, or None when nothing there can be read."""
+    head = _safe(ss + SYS_TRADING, SYS_HEAD) if ss else None
     if head is None:
-        return None, None
+        return None
     trading, wealth = struct.unpack_from("<ii", head, 0)
     conflict, race = struct.unpack_from("<ii", head, SYS_CONFLICT - SYS_TRADING)
     planets, = struct.unpack_from("<i", head, SYS_PLANETS - SYS_TRADING)
     star, = struct.unpack_from("<i", head, SYS_STAR - SYS_TRADING)
-    # Every one of these is one of the game's enums: TradingClass 0-6, WealthClass 0-3, PlayerConflictData 0-3,
-    # AlienRace 0-8, GalaxyStarTypes 0-4, and a system has at most six planets. One out of range and none are trusted.
-    if not (0 <= trading <= 6 and 0 <= wealth <= 3 and 0 <= conflict <= 3 and 0 <= race <= 8 and 0 <= star <= 4 and 0 <= planets <= 6):
+    ua, = struct.unpack_from("<Q", head, SYS_UA - SYS_TRADING)
+    raw = {"economy": trading, "wealth": wealth, "conflict": conflict, "race": race, "star": star, "planets": planets,
+           "ua": ua, "indices": None}
+    if 1 <= planets <= 6:
+        indices = []
+        for i in range(planets):
+            got = _safe(ss + SYS_PLANET0 + i * PLANET_SIZE + PLANET_DATA + PD_PLANET_INDEX, 4)
+            indices.append(struct.unpack("<i", got)[0] if got else None)
+        raw["indices"] = indices
+    return raw
+
+
+def _describe(raw, loc):
+    """What was read at a candidate, for the probe: the numbers, whether the address matched, the planet indices."""
+    if raw is None:
+        return "nothing readable there"
+    nums = " ".join(f"{k}={raw[k]}" for k, _, _ in SYSTEM_FIELDS)
+    got = _ua_address(raw["ua"]) if raw["ua"] else None
+    ua = "address 0" if got is None else f"address system={got['system']} x={got['x']} y={got['y']} z={got['z']} ({'matches' if _ua_matches(raw['ua'], loc) else 'not the player'})"
+    return f"{nums}; {ua}; planet indices {raw['indices']}"
+
+
+def _pointer_like(value):
+    """Whether a number could be a pointer to a heap object."""
+    return 0x10000 <= value < 0x7FFFFFFF0000 and value % 8 == 0
+
+
+def _pointer_at(addr):
+    got = _safe(addr, 8)
+    return struct.unpack("<Q", got)[0] if got else None
+
+
+_ss_at = None          # where in cGcSimulation the solar system pointer was last found
+_search_after = 0.0    # time.monotonic() before which no new search is made
+
+
+def _search_system(sim_addr, loc, trace):
+    """Where in cGcSimulation's search window a pointer to the player's solar system sits, or None."""
+    lo, hi = SIM_SEARCH
+    shaped = readable = unread = 0
+    for chunk in range(lo, hi, SEARCH_CHUNK):
+        raw = _safe(sim_addr + chunk, SEARCH_CHUNK)
+        if raw is None:
+            unread += 1
+            continue
+        for i, (value,) in enumerate(struct.iter_unpack("<Q", raw)):
+            if not _pointer_like(value):
+                continue
+            shaped += 1
+            cand = _system_raw(value)
+            if cand is None:
+                continue
+            readable += 1
+            ok, why = _is_system(cand, loc, strict=True)
+            if ok:
+                off = chunk + i * 8
+                trace.append(f"  search: found at sim+0x{off:X} ({why}): {_describe(cand, loc)}")
+                return off
+    trace.append(f"  search sim+0x{lo:X}..0x{hi:X}: {shaped} pointer-shaped values, {readable} readable, "
+                 f"{unread} unreadable chunks; none is the player's system")
+    return None
+
+
+def _solar_system(sim_addr, loc, trace, now):
+    """The player's solar system: (its address, what was read there), or (0, None). Every step goes to trace."""
+    global _ss_at, _search_after
+    places = ([_ss_at] if _ss_at is not None else []) + [o for o in SIM_SOLAR_SYSTEM if o != _ss_at]
+    for off in places:
+        ss = _pointer_at(sim_addr + off)
+        if not ss:
+            trace.append(f"  sim+0x{off:X}: {'pointer null' if ss == 0 else 'not readable'}")
+            continue
+        raw = _system_raw(ss)
+        ok, why = _is_system(raw, loc)
+        trace.append(f"  sim+0x{off:X}: pointer set; {_describe(raw, loc)} -> {'taken' if ok else 'not taken'} ({why})")
+        if ok:
+            if off != _ss_at:
+                logger.info(f"NMS Deck bridge: solar system pointer at cGcSimulation+0x{off:X}")
+            _ss_at = off
+            return ss, raw
+    if now < _search_after:
+        trace.append(f"  search: not before {_search_after - now:.0f}s from now")
+        return 0, None
+    _search_after = now + SEARCH_EVERY
+    off = _search_system(sim_addr, loc, trace)
+    if off is None:
+        return 0, None
+    logger.info(f"NMS Deck bridge: solar system pointer found by search at cGcSimulation+0x{off:X}")
+    _ss_at = off
+    ss = _pointer_at(sim_addr + off)
+    return ss, _system_raw(ss)
+
+
+def _world(sim_addr, loc, trace=None, now=None):
+    """The solar system and the planet the player is at, for the keys: (system or None, planet or None). Checked
+    against the game (build 179666, 2026-09-25): the system's economy, wealth, conflict and race match the galaxy map,
+    and the planet's type, weather, flora, fauna and resources match its discovery page, through the game's own
+    translations. `loc` is the player's galactic address, which counts planets from 1 (0 is none: space, a station).
+    Each step, and which check failed, goes to `trace` for the probe."""
+    trace = [] if trace is None else trace
+    loc = loc or {}
+    ss, raw = _solar_system(sim_addr, loc, trace, time.monotonic() if now is None else now)
+    if raw is None:
+        trace.append("  system: unknown (no pointer led to the player's solar system)")
         return None, None
-    system = {"economy": trading, "wealth": wealth, "conflict": conflict, "race": race, "star": star, "planets": planets}
-    if not (isinstance(planet_number, int) and 1 <= planet_number <= planets):
+    system, bad = _system_fields(raw)
+    trace.append("  system: read" + (f"; unknown: {', '.join(f'{k} ({raw[k]})' for k in bad)}" if bad else ", every field in range"))
+    planet_number = loc.get("planet")
+    if not isinstance(planet_number, int) or planet_number == 0:
+        trace.append(f"  planet: none (address planet {planet_number!r}: space or a station)")
+        return system, None
+    most = system["planets"] or 6   # a count read as unknown still allows six: the planet's own index is checked below
+    if not 1 <= planet_number <= most:
+        trace.append(f"  planet: none (address planet {planet_number} past the system's {most} planets)")
         return system, None
     pd = ss + SYS_PLANET0 + (planet_number - 1) * PLANET_SIZE + PLANET_DATA
     # The planet's own index (cGcPlanetData::PlanetIndex) must be the one the address points at: planet data that has
     # moved fails this before anything is read from it.
-    raw = _safe(pd + PD_PLANET_INDEX, 4)
-    if not raw or struct.unpack("<i", raw)[0] != planet_number - 1:
+    got = _safe(pd + PD_PLANET_INDEX, 4)
+    index = struct.unpack("<i", got)[0] if got else None
+    if index != planet_number - 1:
+        trace.append(f"  planet: unknown (planet data index {'not readable' if index is None else index}, wanted {planet_number - 1})")
         return system, None
     info = {}
     for label, off in INFO_FIELDS:
@@ -312,7 +490,40 @@ def _world(sim_addr, planet_number):
         "richResources": _flag(_byte(pd + PD_RESOURCE_LEVEL)),
         "scrap": _flag(_byte(pd + PD_HAS_SCRAP)),
     }
+    unknown = [k for k, v in planet.items() if v is None]
+    trace.append(f"  planet: read (planet {planet_number})" + (f"; unknown: {', '.join(unknown)}" if unknown else ", every field read"))
     return system, planet
+
+
+# EnvironmentLocation's names, for the probe (see _where).
+LOCATIONS = ["None", "Default (space)", "SpaceStation", "PlanetOnFoot", "PlanetInShip", "PlanetInVehicle", "Underwater",
+             "Cave", "IndoorInBase", "Freighter", "FreighterInternals", "AbandonedFreighter", "InFleet", "InSpaceObject",
+             "Nexus", "Anomaly"]
+
+
+def _game_build(exe=None):
+    """The game's FileVersion (180383 for the 2026-09-30 update), from the running exe's version resource, or None."""
+    try:
+        ver = ctypes.WinDLL("version")
+        if exe is None:
+            buf = ctypes.create_unicode_buffer(1024)
+            ctypes.WinDLL("kernel32").GetModuleFileNameW(None, buf, 1024)
+            exe = buf.value
+        size = ver.GetFileVersionInfoSizeW(exe, None)
+        if not size:
+            return None
+        data = ctypes.create_string_buffer(size)
+        if not ver.GetFileVersionInfoW(exe, 0, size, data):
+            return None
+        ptr, n = ctypes.c_void_p(), ctypes.c_uint()
+        if not ver.VerQueryValueW(data, "\\VarFileInfo\\Translation", ctypes.byref(ptr), ctypes.byref(n)) or n.value < 4:
+            return None
+        lang, page = struct.unpack("<HH", ctypes.string_at(ptr.value, 4))
+        if not ver.VerQueryValueW(data, f"\\StringFileInfo\\{lang:04x}{page:04x}\\FileVersion", ctypes.byref(ptr), ctypes.byref(n)):
+            return None
+        return ctypes.wstring_at(ptr.value, n.value).rstrip("\x00").strip() or None
+    except Exception:
+        return None
 
 
 # ---- speed -----------------------------------------------------------------------------------------------------------
@@ -436,7 +647,9 @@ class NMSDeckBridge(Mod):
         super().__init__()
         self._last = 0.0
         self._failed = {}   # field -> the first error it gave, for the probe report
-        self._probed = False
+        self._probes = {}   # where the player was (EnvironmentLocation) -> what the world read gave there, for the probe
+        self._probe_due, self._probe_t = False, -PROBE_EVERY
+        self._trace = []    # the last world read's steps
         self._pos, self._pos_t = None, 0.0   # the last position read, and when, for the speed
         self._ship, self._ship_t = 0, 0.0    # the flown ship (cGcSpaceshipComponent), and when the game last updated it
         os.makedirs(OUT_DIR, exist_ok=True)
@@ -466,9 +679,8 @@ class NMSDeckBridge(Mod):
             logger.error("NMS Deck bridge: snapshot failed\n" + traceback.format_exc())
             return
         self._write(state)
-        if state.get("inGame") and not self._probed:
-            self._probed = True
-            self._write_probe(state)
+        if state.get("inGame"):
+            self._note_probe(state, now)
 
     # ---- reading ------------------------------------------------------------------------------------------------------
     def _read(self, name, fn):
@@ -490,11 +702,12 @@ class NMSDeckBridge(Mod):
         suit, ship, primary = self._read("tech", lambda: _tech(ctypes.addressof(ps), _anchor)) or ({}, {}, None)
         sim = self._read("simulation", lambda: gameData.simulation)
         loc = state.get("location") or {}
-        system, planet = (self._read("world", lambda: _world(ctypes.addressof(sim), loc.get("planet"))) or (None, None)) if sim is not None else (None, None)
+        t = time.monotonic()
+        self._trace = trace = [f"  simulation {'found' if sim is not None else 'not found'}"]
+        system, planet = (self._read("world", lambda: _world(ctypes.addressof(sim), loc, trace, t)) or (None, None)) if sim is not None else (None, None)
         env = self._read("player_environment", lambda: gameData.player_environment)
         pos = self._read("position", lambda: _position(ctypes.addressof(env))) if env is not None else None
         where = self._read("where", lambda: _where(ctypes.addressof(env))) if env is not None else None
-        t = time.monotonic()
         flying = self._ship and t - self._ship_t < POWER_FRESH
         power = self._read("power", lambda: _power(self._ship)) if flying else None
         scale = SPEED_SCALE_EXOCRAFT if where and where["stable"] == IN_EXOCRAFT else SPEED_SCALE
@@ -527,10 +740,34 @@ class NMSDeckBridge(Mod):
         except OSError as e:
             logger.warning(f"NMS Deck bridge: could not write the state file: {e}")
 
+    def _note_probe(self, state, now):
+        """Keeps, for each place the player has been (space, a station, on foot...), what the system and planet read
+        gave there and every step of it; the probe is rewritten when a place is new or its result changes, at most
+        every PROBE_EVERY seconds, so one probe at the end of a session covers every place visited."""
+        where = state.get("where") or {}
+        system = state.get("system")
+        result = (system is not None, tuple(k for k, v in (system or {}).items() if v is None), state.get("planet") is not None,
+                  (state.get("location") or {}).get("planet"))
+        place = where.get("stable")
+        seen = self._probes.get(place)
+        if seen is None or seen["result"] != result:
+            self._probes[place] = {"result": result, "at": time.strftime("%H:%M:%S"), "where": where, "location": state.get("location"),
+                                   "system": system, "planet": state.get("planet"), "trace": list(self._trace)}
+            self._probe_due = True
+        if self._probe_due and now - self._probe_t >= PROBE_EVERY:
+            self._probe_due, self._probe_t = False, now
+            self._write_probe(state)
+
     def _write_probe(self, state):
-        """Once a session, in a world: every field and what it read, and what could not be read. Used to check a
-        game update against NMS.py's offsets."""
+        """In a world: every field and what it read, what could not be read, and how the solar system and planet were
+        read in each place the player has been, step by step. Used to check a game update against NMS.py's offsets."""
         lines = [f"NMS Deck bridge {VERSION} probe, {time.strftime('%Y-%m-%d %H:%M:%S')}", ""]
+        try:
+            from importlib.metadata import version as _dist_version
+            nmspy_version = _dist_version("nmspy")
+        except Exception:
+            nmspy_version = None
+        lines += [f"game build   {_game_build()!r}", f"NMS.py       {nmspy_version!r}", ""]
         # NMS.py's settings as they reached the game: the control panel slows the game, and installs turn it off.
         try:
             import pymhf.core._internal as internal
@@ -544,6 +781,14 @@ class NMSDeckBridge(Mod):
         lines.append("could not read:" if self._failed else "every field read")
         for key, err in self._failed.items():
             lines.append(f"  {key}: {err}")
+        lines += ["", f"solar system pointer: cGcSimulation+0x{_ss_at:X}" if _ss_at is not None else "solar system pointer: not found yet",
+                  "", "the system and planet, by where the player was (the last change in each place):"]
+        for place in sorted(self._probes, key=lambda p: -1 if p is None else p):
+            seen = self._probes[place]
+            name = LOCATIONS[place] if isinstance(place, int) and 0 <= place < len(LOCATIONS) else "where unknown"
+            lines += ["", f"[{place} {name}] at {seen['at']}, where {seen['where']!r}",
+                      f"  location {seen['location']!r}", f"  system   {seen['system']!r}", f"  planet   {seen['planet']!r}"]
+            lines += seen["trace"]
         try:
             with open(PROBE, "w", encoding="utf-8") as f:
                 f.write("\n".join(lines) + "\n")

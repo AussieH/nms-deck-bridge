@@ -18,20 +18,25 @@ online play. This repository is here so you can see exactly what it does.
 - The solar system (economy, wealth, conflict, race, star, number of planets) and the planet you are on (type,
   weather, flora, fauna, resources, scrap), with the planet's words through the game's own translator.
 
-It also writes `%APPDATA%\NMSDeck\probe.txt` once a session: every field, and anything that could not be read.
+It also writes `%APPDATA%\NMSDeck\probe.txt`: every field, anything that could not be read, the game build, and for
+each place you have been (space, a station, on foot...) each step of the system and planet reads and which check
+turned one down. It is rewritten when a place is new or its result changes.
 
 ## How it finds things
 
 NMS.py finds functions by byte pattern and fields by offset, so a game update can move what it reads. The bridge
 leans on shapes rather than offsets where it can: the player state by its run of galactic addresses, the player's
-position by its transform, inventories by their item lists. Every read through a pointer uses `ReadProcessMemory`,
-which fails politely on a bad address where a plain read would take the game down, and values read at a fixed
-distance are checked against what the game allows (enums, flags, a planet's own index, an inventory's class), so a
-field that has moved reads as unknown rather than wrong. Besides NMS.py's main loop it watches one game function,
+position by its transform, inventories by their item lists, and the current solar system by the game's own pointer to
+it (tried where it is known to live, then searched for), taken only when what it points at is your system. Every read
+through a pointer uses `ReadProcessMemory`, which fails politely on a bad address where a plain read would take the
+game down, and values read at a fixed distance are checked against what the game allows (enums, flags, a planet's own
+index, an inventory's class), each on its own, so a field that has moved reads as unknown rather than wrong and the
+fields beside it still show. Besides NMS.py's main loop it watches one game function,
 `cGcSpaceshipComponent::UpdateControlled`, which the game runs for the ship you are flying: the bridge keeps only
 that ship's address, to read its power setting, and does nothing else there.
 
-Written against game build 179666 with NMS.py 179105.0.
+Written against game build 179666 with NMS.py 179105.0. 0.6.1 follows build 180383 (2026-09-30), which moved the
+solar system pointer.
 
 ## Installing
 
